@@ -202,11 +202,7 @@ WaylandNativeWindow::WaylandNativeWindow(struct wl_egl_window *window, struct wl
 WaylandNativeWindow::~WaylandNativeWindow()
 {
     std::list<WaylandNativeWindowBuffer *>::iterator it = m_bufList.begin();
-    for (; it != m_bufList.end(); it++)
-    {
-        WaylandNativeWindowBuffer* buf=*it;
-        destroyBuffer(buf);
-    }
+    destroyBuffers();
     wl_registry_destroy(registry);
     wl_event_queue_destroy(wl_queue);
     android_wlegl_destroy(m_android_wlegl);
@@ -692,6 +688,7 @@ void WaylandNativeWindow::destroyBuffers()
     for (; it!=m_bufList.end(); ++it)
     {
         destroyBuffer(*it);
+        it = m_bufList.erase(it);
     }
     m_bufList.clear();
     m_freeBufs = 0;
