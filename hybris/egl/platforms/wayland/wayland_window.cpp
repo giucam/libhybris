@@ -109,7 +109,7 @@ WaylandNativeWindow::registry_handle_global(void *data, struct wl_registry *regi
     WaylandNativeWindow *nw = static_cast<WaylandNativeWindow *>(data);
 
     if (strcmp(interface, "android_wlegl") == 0) {
-        nw->m_android_wlegl = static_cast<struct android_wlegl *>(wl_registry_bind(registry, name, &android_wlegl_interface, 1));
+        nw->m_android_wlegl = static_cast<struct android_wlegl *>(wl_registry_bind(registry, name, &android_wlegl_interface, std::min(2u, version)));
     }
 }
 
@@ -163,7 +163,7 @@ static void check_fatal_error(struct wl_display *display)
     abort();
 }
 
-WaylandNativeWindow::WaylandNativeWindow(struct wl_egl_window *window, struct wl_display *display, alloc_device_t* alloc_device)
+WaylandNativeWindow::WaylandNativeWindow(struct wl_egl_window *window, struct wl_display *display, alloc_device_t* alloc_device, gralloc_module_t *gralloc)
 {
     int wayland_ok;
 
@@ -188,6 +188,7 @@ WaylandNativeWindow::WaylandNativeWindow(struct wl_egl_window *window, struct wl
     assert(this->m_android_wlegl != NULL);
 
     this->m_alloc = alloc_device;
+    m_gralloc = gralloc;
 
     m_usage=GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE;
     pthread_mutex_init(&mutex, NULL);
@@ -229,7 +230,6 @@ static struct wl_buffer_listener wl_buffer_listener = {
 
 void WaylandNativeWindow::releaseBuffer(struct wl_buffer *buffer)
 {
-    lock();
     std::list<WaylandNativeWindowBuffer *>::iterator it = posted.begin();
 
     for (; it != posted.end(); it++)
@@ -284,7 +284,6 @@ void WaylandNativeWindow::releaseBuffer(struct wl_buffer *buffer)
 
     pthread_cond_signal(&cond);
     HYBRIS_TRACE_END("wayland-platform", "releaseBuffer", "-%p", wnb);
-    unlock();
 }
 
 
@@ -396,16 +395,14 @@ int WaylandNativeWindow::postBuffer(ANativeWindowBuffer* buffer)
 
     lock();
     wnb->busy = 1;
-    unlock();
     ret = wl_display_dispatch_queue_pending(m_display, this->wl_queue);
 
     if (ret < 0) {
+        unlock();
         TRACE("wl_display_dispatch_queue returned an error:%i", ret);
         check_fatal_error(m_display);
         return ret;
     }
-
-    lock();
 
     if (wnb->wlbuffer == NULL)
     {
@@ -501,7 +498,7 @@ int WaylandNativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd
 
     if (wnb->wlbuffer == NULL)
     {
-        wnb->wlbuffer_from_native_handle(m_android_wlegl, m_display, wl_queue);
+        wnb->init(m_android_wlegl, m_display, wl_queue);
         TRACE("%p add listener with %p inside", wnb, wnb->wlbuffer);
         wl_buffer_add_listener(wnb->wlbuffer, &wl_buffer_listener, this);
         wl_proxy_set_queue((struct wl_proxy *) wnb->wlbuffer, this->wl_queue);
@@ -548,9 +545,7 @@ int WaylandNativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd
 
         /* We have fronted all our buffers, let's wait for one of them to be free */
         do {
-            unlock();
             ret = wl_display_dispatch_queue(m_display, this->wl_queue);
-            lock();
             if (ret == -1)
             {
                 check_fatal_error(m_display);
@@ -696,9 +691,16 @@ void WaylandNativeWindow::destroyBuffers()
 
 WaylandNativeWindowBuffer *WaylandNativeWindow::addBuffer() {
 
-    WaylandNativeWindowBuffer *wnb = new WaylandNativeWindowBuffer(m_alloc, m_width, m_height, m_format, m_usage);
+    WaylandNativeWindowBuffer *wnb;
+    static bool useServerSideBuffers = getenv("HYBRIS_USE_SERVER_SIDE_WAYLAND_BUFFERS") != NULL;
+
+    if (useServerSideBuffers) {
+        wnb = new ServerWaylandBuffer(m_width, m_height, m_format, m_usage, m_gralloc, m_android_wlegl);
+        wayland_roundtrip(this);
+    } else {
+        wnb = new ClientWaylandBuffer(m_alloc, m_width, m_height, m_format, m_usage);
+    }
     m_bufList.push_back(wnb);
-    wnb->common.incRef(&wnb->common);
     ++m_freeBufs;
 
     TRACE("wnb:%p width:%i height:%i format:x%x usage:x%x",
@@ -767,4 +769,80 @@ int WaylandNativeWindow::setUsage(int usage) {
     }
     return NO_ERROR;
 }
+
+void ClientWaylandBuffer::init(struct android_wlegl *android_wlegl,
+                                     struct wl_display *display,
+                                     struct wl_event_queue *queue)
+{
+    wlbuffer_from_native_handle(android_wlegl, display, queue);
+}
+
+static void ssb_ints(void *data, android_wlegl_server_buffer_handle *, wl_array *ints)
+{
+    ServerWaylandBuffer *wsb = static_cast<ServerWaylandBuffer *>(data);
+    wl_array_copy(&wsb->ints, ints);
+}
+
+static void ssb_fd(void *data, android_wlegl_server_buffer_handle *, int fd)
+{
+    ServerWaylandBuffer *wsb = static_cast<ServerWaylandBuffer *>(data);
+    int *ptr = (int *)wl_array_add(&wsb->fds, sizeof(int));
+    *ptr = fd;
+}
+
+static void ssb_buffer(void *data, android_wlegl_server_buffer_handle *, wl_buffer *buffer, int32_t format, int32_t stride)
+{
+    ServerWaylandBuffer *wsb = static_cast<ServerWaylandBuffer *>(data);
+
+    native_handle_t *native;
+    int numFds = wsb->fds.size / sizeof(int);
+    int numInts = wsb->ints.size / sizeof(int32_t);
+
+    native = native_handle_create(numFds, numInts);
+
+    memcpy(&native->data[0], wsb->fds.data, wsb->fds.size);
+    memcpy(&native->data[numFds], wsb->ints.data, wsb->ints.size);
+    /* ownership of fds passed to native_handle_t */
+    wsb->fds.size = 0;
+
+    wsb->handle = (buffer_handle_t) native;
+    wsb->format = format;
+    wsb->stride = stride;
+
+    int ret = wsb->m_gralloc->registerBuffer(wsb->m_gralloc, wsb->handle);
+    if (ret) {
+        fprintf(stderr,"failed to register buffer\n");
+        return;
+    }
+
+    wsb->common.incRef(&wsb->common);
+    wsb->m_buf = buffer;
+}
+
+static const struct android_wlegl_server_buffer_handle_listener server_handle_listener = {
+    ssb_fd,
+    ssb_ints,
+    ssb_buffer,
+};
+
+ServerWaylandBuffer::ServerWaylandBuffer(unsigned int w, unsigned int h, int f, int u, gralloc_module_t *gralloc, android_wlegl *android_wlegl)
+                   : WaylandNativeWindowBuffer()
+{
+    ANativeWindowBuffer::width = w;
+    ANativeWindowBuffer::height = h;
+    m_gralloc = gralloc;
+    usage = u;
+
+    wl_array_init(&ints);
+    wl_array_init(&fds);
+
+    android_wlegl_server_buffer_handle *ssb = android_wlegl_get_server_buffer_handle(android_wlegl, width, height, f, u);
+    android_wlegl_server_buffer_handle_add_listener(ssb, &server_handle_listener, this);
+}
+
+void ServerWaylandBuffer::init(android_wlegl *, wl_display *, wl_event_queue *)
+{
+    wlbuffer = m_buf;
+}
+
 // vim: noai:ts=4:sw=4:ss=4:expandtab

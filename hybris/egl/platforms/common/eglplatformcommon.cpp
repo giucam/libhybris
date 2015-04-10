@@ -93,7 +93,7 @@ extern "C" void hybris_dump_buffer_to_file(ANativeWindowBuffer *buf)
 extern "C" EGLBoolean eglplatformcommon_eglBindWaylandDisplayWL(EGLDisplay dpy, struct wl_display *display)
 {
 	assert(my_gralloc != NULL);
-	server_wlegl_create(display, my_gralloc);
+	server_wlegl_create(display, my_gralloc, my_alloc);
 	return EGL_TRUE;
 }
 
@@ -103,7 +103,7 @@ extern "C" EGLBoolean eglplatformcommon_eglUnbindWaylandDisplayWL(EGLDisplay dpy
 }
 
 extern "C" EGLBoolean eglplatformcommon_eglQueryWaylandBufferWL(EGLDisplay dpy,
-	struct wl_buffer *buffer, EGLint attribute, EGLint *value)
+	struct wl_resource *buffer, EGLint attribute, EGLint *value)
 {
 	server_wlegl_buffer *buf  = server_wlegl_buffer_from(buffer);
 	ANativeWindowBuffer* anwb = (ANativeWindowBuffer *) buf->buf;
@@ -204,9 +204,9 @@ eglplatformcommon_passthroughImageKHR(EGLContext *ctx, EGLenum *target, EGLClien
 	static int debugenvchecked = 0;
 	if (*target == EGL_WAYLAND_BUFFER_WL)
 	{
-		server_wlegl_buffer *buf = server_wlegl_buffer_from((struct wl_buffer *)*buffer);
-		HYBRIS_TRACE_BEGIN("eglplatformcommon", "Wayland_eglImageKHR", "-resource@%i", ((struct wl_buffer *)*buffer)->resource.object.id);
-		HYBRIS_TRACE_END("eglplatformcommon", "Wayland_eglImageKHR", "-resource@%i", ((struct wl_buffer *)*buffer)->resource.object.id);
+		server_wlegl_buffer *buf = server_wlegl_buffer_from((struct wl_resource *)*buffer);
+		HYBRIS_TRACE_BEGIN("eglplatformcommon", "Wayland_eglImageKHR", "-resource@%i", wl_resource_get_id((struct wl_resource *)*buffer));
+		HYBRIS_TRACE_END("eglplatformcommon", "Wayland_eglImageKHR", "-resource@%i", wl_resource_get_id((struct wl_resource *)*buffer));
 		if (debugenvchecked == 0)
 		{
 			if (getenv("HYBRIS_WAYLAND_KHR_DUMP_BUFFERS") != NULL)
